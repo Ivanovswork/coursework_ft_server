@@ -1,9 +1,9 @@
 {
     "127.0.0.1": {
-        "first_seen": "2025-04-07 19:27:25.135245",
+        "first_seen": "2025-04-12 10:38:23.838138",
         "block": false,
         "quote": 1526260,
-        "occupied_space": 0,
-        "request_count": 26
+        "occupied_space": 106,
+        "request_count": 88
     }
 }

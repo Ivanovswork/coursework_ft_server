@@ -6,15 +6,31 @@ import threading
 from datetime import datetime
 
 # --- Конфигурация сервера ---
-SERVER_HOST = '0.0.0.0'  # Слушать на всех интерфейсах
+SERVER_HOST = '0.0.0.0'
 SERVER_PORT = 12345
 CONFIG_FILE = 'client_ips.json'
 SERVER_FOLDER = 'server_data'  # Папка сервера
-CHUNK_SIZE = 8192  # Размер чанка для потоковой передачи
+CHUNK_SIZE = 65535  # Размер чанка для потоковой передачи
 
 # --- Блокировка для доступа к файлам ---
 file_lock = threading.Lock()
 
+GET = b'\x01'
+PUT = b'\x02'
+DELETE = b'\x03'
+LIST = b'\x04'
+RESPONSE = b'\x05'
+
+FileNotFound = b'\x01'
+ConnectionBreak = b'\x02'
+СhecksumError = b'\x03'
+
+FLAG_ERROR = b'\x80'
+FLAG_SIZE = b"\x40"
+FLAG_STATUS = b'\x20'
+
+STATUS_OK = b"\x80"
+STATUS_NOTOK = b"\x00"
 
 # --- Функции сервера ---
 def load_client_ips():
@@ -101,89 +117,115 @@ async def handle_client_request(loop, client_socket, client_address, client_ips)
     client_ip = client_address[0]
 
     try:
-        await loop.sock_sendall(client_socket, f"OK".encode('utf-8'))
+        await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_OK)
         print(f"Сервер: Попытка подключения принята: {client_address}")
         data = await loop.sock_recv(client_socket, 1024)  # Получаем запрос от клиента
         if not data:
             print(f"Сервер: Клиент {client_address} отключился.")
             return
 
-        message = data.decode('utf-8')
-        command, filename = message.split(" ", 1)
-        print(f"Сервер: Получен запрос от {client_address}: {command, filename}")
+        command = data[:1]
+        filename = ''
 
-        if command == "GET":
+        if command == GET:
+            filename_size = int.from_bytes(data[1:3], byteorder='big')
+            filename = data[3:].decode('utf-8')
+            # print(data)
+            # print(filename_size)
+            # print(filename)
             try:
                 filepath = os.path.join(SERVER_FOLDER + f"/{client_ip}", filename)
                 file_size = os.path.getsize(filepath)
                 print(f"Сервер: Размер запрашиваемого файла: {file_size}")
-                await loop.sock_sendall(client_socket, f"OK {file_size}".encode('utf-8'))  # Отправляем размер файла
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_SIZE + file_size.to_bytes(4, "big"))  # Отправляем размер файла
+                # print(RESPONSE, FLAG_SIZE == b'\x40', file_size.to_bytes(4, "big"))
                 response = await loop.sock_recv(client_socket, 1024)  # Ждем подтверждения от клиента (READY)
-                if response.decode('utf-8') == "READY":
+                # print(response)
+                if response[:1] == RESPONSE and response[1:2] == FLAG_STATUS and response[2:] == STATUS_OK:
                     await send_file(loop, client_socket, filepath)  # Отправляем файл потоком
                     print(f"Сервер: Отправлен файл '{filename}' клиенту {client_address}, размер: {file_size} байт.")
+                    response = await loop.sock_recv(client_socket, 1024)
+                    if response[:1] == RESPONSE and response[1:2] == FLAG_STATUS and response[2:] == STATUS_OK:
+                        print("Сервер: Клиент принял файл")
+                    else:
+                        print("Сервер: Ошибка принятия файла у клиента")
                 else:
                     print("Сервер: Клиент не готов к приему файла")
 
             except FileNotFoundError:
-                await loop.sock_sendall(client_socket, "ERROR File not found".encode('utf-8'))
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + FileNotFound)
             except Exception as e:
-                await loop.sock_sendall(client_socket, f"ERROR {str(e)}".encode('utf-8'))
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + ConnectionBreak)
 
-        elif command == "PUT":
+            await update_request_count(client_ip)
+        elif command == PUT:
+            filename_size = int.from_bytes(data[1:3], byteorder='big')
+            filename = data[3:].decode('utf-8')
+
             try:
-                await loop.sock_sendall(client_socket, "READY".encode('utf-8'))
+                response = await loop.sock_recv(client_socket, 1024)  # Получаем размер файла от клиента
+                if response[:1] == RESPONSE and response[1:2] == FLAG_SIZE:
+                    file_size = int.from_bytes(response[2:], 'big')
+                else:
+                    if response[:1] == RESPONSE and response[1:2] == FLAG_ERROR and response[2:] == FileNotFound:
+                        print(f"Клиент: Ошибка: файл не найден")
+                    else:
+                        print(f"Клиент: Непредвиденная ошибка")
                 filepath = os.path.join(SERVER_FOLDER + f"/{client_ip}", filename)
-                file_size_data = await loop.sock_recv(client_socket, 1024)  # Получаем размер файла от клиента
-                file_size = int(file_size_data.decode('utf-8'))
                 print(f"Сервер: Получен размер файла от клиента: {file_size}")
                 response = await update_occupied_space(client_ip, file_size)
-
                 if response:
-                    await loop.sock_sendall(client_socket, "READY".encode('utf-8')) # Подтверждаем готовность к приему
+                    await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_OK)  # Подтверждаем готовность к приему
                 else:
-                    await loop.sock_sendall(client_socket, "Передача невозможна, превышена квота".encode('utf-8'))
+                    await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_NOTOK)
 
                 success = await receive_file(loop, client_socket, filepath, file_size)
-                if success:
-                    print(f"Сервер: Получен файл '{filename}' от клиента {client_address}, размер: {file_size} байт.")
-                    await loop.sock_sendall(client_socket, "OK File saved".encode('utf-8'))
+                if not success:
+                    print("Сервер: Ошибка при получении файла.")
+                    await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_NOTOK)
                 else:
-                     await loop.sock_sendall(client_socket, "ERROR File transfer failed".encode('utf-8'))
+                    await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_OK)
 
             except Exception as e:
-                print(f"Сервер: Ошибка в PUT: {e}")
-                await loop.sock_sendall(client_socket, f"ERROR {str(e)}".encode('utf-8'))
+                print(f"Сервер: Ошибка: {e}")
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + FileNotFound)
 
-        elif command == "LIST":
+            await update_request_count(client_ip)
+
+        elif command == LIST:
             try:
                 with file_lock:  # Получаем блокировку перед доступом к файлу
                     files_info = []
+                    result = b""
                     for filename in os.listdir(SERVER_FOLDER + f"/{client_ip}"):
                         filepath = os.path.join(SERVER_FOLDER + f"/{client_ip}", filename)
                         if os.path.isfile(filepath):
                             file_size = os.path.getsize(filepath)
-                            files_info.append({"name": filename, "size": file_size})
-
-                await loop.sock_sendall(client_socket, f"OK {json.dumps(files_info)}".encode('utf-8'))
+                            result += len(filename).to_bytes(2, "big") + filename.encode("utf-8") + file_size.to_bytes(4, "big")
+                            # print(result)
+                await loop.sock_sendall(client_socket, result)
             except Exception as e:
-                await loop.sock_sendall(client_socket, f"ERROR {str(e)}".encode('utf-8'))
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + ConnectionBreak)
 
             await update_request_count(client_ip)
 
-        elif command == "DELETE":
+        elif command == DELETE:
+            filename_size = int.from_bytes(data[1:3], byteorder='big')
+            filename = data[3:].decode('utf-8')
             try:
                 filepath = os.path.join(SERVER_FOLDER + f"/{client_ip}", filename)
                 file_size = os.path.getsize(filepath)
                 with file_lock:
                     os.remove(filepath)
-                await loop.sock_sendall(client_socket, "OK File deleted".encode('utf-8'))
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_OK)
                 await delete_occupied_space(client_ip, file_size)
                 print(f"Сервер: Файл '{filename}' удален")
             except FileNotFoundError:
-                await loop.sock_sendall(client_socket, "ERROR File not found".encode('utf-8'))
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + FileNotFound)
             except Exception as e:
-                await loop.sock_sendall(client_socket, f"ERROR {str(e)}".encode('utf-8'))
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + ConnectionBreak)
+
+            await update_request_count(client_ip)
         else:
             await loop.sock_sendall(client_socket, "ERROR Invalid command".encode('utf-8'))
 
@@ -196,7 +238,7 @@ async def handle_client_request(loop, client_socket, client_address, client_ips)
 
 
 async def forbidden(loop, client_socket, client_address):
-    await loop.sock_sendall(client_socket, f"NO".encode('utf-8'))
+    await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_NOTOK)
     print(f"Сервер: Попытка подключения отклонена: {client_address}")
 
 
